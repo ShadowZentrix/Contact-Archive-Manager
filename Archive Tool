@@ -1,0 +1,648 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>People List App — Undo/Redo</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <!-- Tailwind (play CDN) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- React + Babel -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    /* Hover preview */
+    #hover-preview { position: absolute; z-index:60; display:none; background:white; border:1px solid #e5e7eb; padding:8px; box-shadow:0 6px 20px rgba(0,0,0,0.08); max-width:380px; font-size:13px; }
+    /* long-press visual */
+    .holding { outline: 2px dashed rgba(59,130,246,0.6); }
+  </style>
+</head>
+<body class="bg-slate-50 min-h-screen">
+  <div id="root" class="p-4"></div>
+
+  <script type="text/babel">
+  const { useState, useEffect, useRef } = React;
+
+  /*********************
+   Helpers
+  *********************/
+  const STORAGE_KEY = 'people_app_v1';
+
+  function uid() {
+    return 'id-' + Math.random().toString(36).slice(2,10);
+  }
+
+  function pad(n, width) { return String(n).padStart(width, '0'); }
+
+  function alphaCode(name) {
+    const c = (name||'').trim().charAt(0).toUpperCase() || 'A';
+    return pad(c.charCodeAt(0) - 64, 2); // A=01
+  }
+
+  function generateNumber(name, year, seqIndex) {
+    // 2 digits alpha code + 4 digits year + 9 digits index
+    return `${alphaCode(name)}${pad(year,4)}${pad(seqIndex,9)}`;
+  }
+
+  function isoNow() { return (new Date()).toISOString(); }
+
+  function formatDateDDMMYYYY(iso) {
+    if (!iso) return '';
+    const d = new Date(iso);
+    const dd = pad(d.getDate(),2);
+    const mm = pad(d.getMonth()+1,2);
+    const yyyy = d.getFullYear();
+    return `${dd}-${mm}-${yyyy}`;
+  }
+
+  function formatLocalTime12(iso) {
+    if (!iso) return '';
+    const d = new Date(iso);
+    return d.toLocaleString(undefined, { hour12: true });
+  }
+
+  function deepClone(x) { return JSON.parse(JSON.stringify(x)); }
+
+  /*********************
+   App
+  *********************/
+  function App() {
+    // people array stored in state
+    const [people, setPeople] = useState([]);
+    // Which person id is open
+    const [openPersonId, setOpenPersonId] = useState(null);
+    // selection mode for multi-delete
+    const [selectionMode, setSelectionMode] = useState(false);
+    const [selectedIds, setSelectedIds] = useState(new Set());
+    // list-level undo/redo stacks (store deep clone arrays)
+    const [listUndoStack, setListUndoStack] = useState([]);
+    const [listRedoStack, setListRedoStack] = useState([]);
+    // hover preview ref
+    const hoverRef = useRef(null);
+
+    // Load from localStorage on mount
+    useEffect(() => {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        try {
+          const parsed = JSON.parse(raw);
+          setPeople(parsed);
+        } catch(e) { console.warn('failed parse storage', e); }
+      } else {
+        // seed sample
+        const seed = [
+          makePerson('Ali','1990',1),
+          makePerson('Shazaib','1976',2),
+        ];
+        setPeople(seed);
+      }
+    }, []);
+
+    // Persist whenever people changes
+    useEffect(() => {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(people));
+    }, [people]);
+
+    // Helper to create person object
+    function makePerson(name, year, seqIndex) {
+      const now = isoNow();
+      return {
+        id: uid(),
+        name: name,
+        year: String(year).padStart(4,'0'),
+        number: generateNumber(name, year, seqIndex),
+        lastEditISO: now,
+        boxes: [],
+        timeline: [{ ts: now, msg: 'Person added' }],
+        // per-person stacks (store snapshots of person)
+        undoStack: [],
+        redoStack: []
+      };
+    }
+
+    // Ensure person has stacks
+    function ensurePersonStacks(p) {
+      if (!p.undoStack) p.undoStack = [];
+      if (!p.redoStack) p.redoStack = [];
+    }
+
+    /******** List-level history functions ********/
+    function pushListUndo(actionDesc) {
+      setListUndoStack(prev => [...prev, deepClone(people)]);
+      setListRedoStack([]); // clear redo on new action
+    }
+
+    function listUndo() {
+      setListUndoStack(prev => {
+        if (prev.length === 0) return prev;
+        const last = prev[prev.length -1];
+        setListRedoStack(r => [...r, deepClone(people)]);
+        setPeople(deepClone(last));
+        // if open person no longer exists, close details
+        setTimeout(() => {
+          const exists = people.find(p => p && p.id === openPersonId);
+          if (!exists) setOpenPersonId(null);
+        }, 0);
+        return prev.slice(0, -1);
+      });
+    }
+
+    function listRedo() {
+      setListRedoStack(prev => {
+        if (prev.length === 0) return prev;
+        const last = prev[prev.length -1];
+        setListUndoStack(u => [...u, deepClone(people)]);
+        setPeople(deepClone(last));
+        setTimeout(() => {
+          const exists = people.find(p => p && p.id === openPersonId);
+          if (!exists) setOpenPersonId(null);
+        }, 0);
+        return prev.slice(0, -1);
+      });
+    }
+
+    /******** Per-person detail history (undo/redo) ********/
+    function pushPersonUndo(personId, actionDesc) {
+      setPeople(prev => {
+        const copy = deepClone(prev);
+        const idx = copy.findIndex(p => p.id === personId);
+        if (idx === -1) return prev;
+        ensurePersonStacks(copy[idx]);
+        copy[idx].undoStack.push(deepClone(copy[idx]));
+        copy[idx].redoStack = []; // clear redo on new action
+        // optionally push an action note? timeline entry will be added by the action itself
+        return copy;
+      });
+    }
+
+    function personUndo(personId) {
+      setPeople(prev => {
+        const copy = deepClone(prev);
+        const idx = copy.findIndex(p => p.id === personId);
+        if (idx === -1) return prev;
+        ensurePersonStacks(copy[idx]);
+        if (copy[idx].undoStack.length === 0) return prev;
+        const last = copy[idx].undoStack.pop();
+        copy[idx].redoStack = copy[idx].redoStack || [];
+        // push current to redo
+        copy[idx].redoStack.push(deepClone(copy[idx]));
+        // replace with last
+        last.undoStack = copy[idx].undoStack || [];
+        last.redoStack = copy[idx].redoStack || [];
+        // add timeline note on the restored object
+        last.timeline = last.timeline || [];
+        last.timeline.unshift({ ts: isoNow(), msg: 'Undid a change (detail)' });
+        copy[idx] = last;
+        return copy;
+      });
+    }
+
+    function personRedo(personId) {
+      setPeople(prev => {
+        const copy = deepClone(prev);
+        const idx = copy.findIndex(p => p.id === personId);
+        if (idx === -1) return prev;
+        ensurePersonStacks(copy[idx]);
+        if (!copy[idx].redoStack || copy[idx].redoStack.length === 0) return prev;
+        const next = copy[idx].redoStack.pop();
+        copy[idx].undoStack = copy[idx].undoStack || [];
+        copy[idx].undoStack.push(deepClone(copy[idx])); // push current to undo
+        next.undoStack = copy[idx].undoStack;
+        next.redoStack = copy[idx].redoStack;
+        next.timeline = next.timeline || [];
+        next.timeline.unshift({ ts: isoNow(), msg: 'Redid a change (detail)' });
+        copy[idx] = next;
+        return copy;
+      });
+    }
+
+    /******** Actions that modify the list ********/
+    function addPerson() {
+      const name = prompt('Enter full name:');
+      if (!name) return;
+      const year = prompt('Enter birth year (YYYY):', new Date().getFullYear());
+      if (!year || isNaN(Number(year))) return alert('Invalid year — cancelled');
+      pushListUndo('Add person');
+      setPeople(prev => {
+        const idx = prev.length + 1;
+        const p = makePerson(name.trim(), String(year).padStart(4,'0'), idx);
+        return [...prev, p];
+      });
+      setOpenPersonId(null);
+    }
+
+    function editNameFromList(personId) {
+      const person = people.find(p => p.id === personId);
+      if (!person) return;
+      const newName = prompt('Edit name:', person.name);
+      if (!newName || newName.trim() === person.name) return;
+      pushListUndo('Edit name (list)');
+      setPeople(prev => prev.map(p => p.id === personId ? ({ ...p, name: newName.trim(), lastEditISO: isoNow(), timeline: [{ ts: isoNow(), msg: `Name changed (list) to ${newName.trim()}` }, ...(p.timeline||[])] }) : p));
+    }
+
+    function multiDeleteSelected() {
+      if (selectedIds.size === 0) return;
+      const names = people.filter(p => selectedIds.has(p.id)).map(p=>p.name).join(', ');
+      const confirmation = confirm(`Delete ${selectedIds.size} person(s): ${names}?\n\nWARNING: their timelines will be permanently removed on deletion. Proceed?`);
+      if (!confirmation) return;
+      // push snapshot where deleted persons' timeline cleared (so undo will restore person but not old timeline)
+      setListUndoStack(prev => {
+        const snapshot = deepClone(people);
+        snapshot.forEach(p => {
+          if (selectedIds.has(p.id)) {
+            p.timeline = [];
+            p.undoStack = [];
+            p.redoStack = [];
+          }
+        });
+        return [...prev, snapshot];
+      });
+      setListRedoStack([]); // clear redo
+      setPeople(prev => prev.filter(p => !selectedIds.has(p.id)));
+      setSelectionMode(false);
+      setSelectedIds(new Set());
+      if (openPersonId && selectedIds.has(openPersonId)) setOpenPersonId(null);
+    }
+
+    function exportSnapshot() {
+      const blob = new Blob([JSON.stringify(people, null, 2)], { type:'application/json' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'people_snapshot.json';
+      a.click();
+    }
+
+    /******** Details actions (boxes etc) ********/
+    function openDetails(personId) {
+      setOpenPersonId(personId);
+    }
+
+    function addBox(personId) {
+      const text = prompt('Enter detail text:');
+      if (!text) return;
+      pushPersonUndo(personId, 'Add box');
+      setPeople(prev => prev.map(p => {
+        if (p.id !== personId) return p;
+        const copy = deepClone(p);
+        copy.boxes = copy.boxes || [];
+        copy.boxes.push(text);
+        copy.lastEditISO = isoNow();
+        copy.timeline = copy.timeline || [];
+        copy.timeline.unshift({ ts: isoNow(), msg: `Added box: ${text}` });
+        return copy;
+      }));
+    }
+
+    function editOrDeleteBox(personId, index) {
+      const person = people.find(p => p.id === personId);
+      if (!person) return;
+      const old = (person.boxes && person.boxes[index]) || '';
+      const newVal = prompt('Edit box (leave empty to delete):', old);
+      if (newVal === null) return; // cancelled
+      pushPersonUndo(personId, 'Edit/Delete box');
+      setPeople(prev => prev.map(p => {
+        if (p.id !== personId) return p;
+        const copy = deepClone(p);
+        copy.boxes = copy.boxes || [];
+        if (newVal === '') {
+          const deleted = copy.boxes.splice(index, 1)[0];
+          copy.timeline = copy.timeline || [];
+          copy.timeline.unshift({ ts: isoNow(), msg: `Deleted box ${index+1}: ${deleted}` });
+        } else {
+          copy.boxes[index] = newVal;
+          copy.timeline = copy.timeline || [];
+          copy.timeline.unshift({ ts: isoNow(), msg: `Edited box ${index+1} from '${old}' to '${newVal}'` });
+        }
+        copy.lastEditISO = isoNow();
+        return copy;
+      }));
+    }
+
+    function editNameFromDetails(personId) {
+      // per spec: name changes performed via list-level change to keep details stack separate
+      const p = people.find(pp => pp.id === personId);
+      if (!p) return;
+      const newName = prompt('Edit name (this changes list name too):', p.name);
+      if (!newName || newName.trim() === p.name) return;
+      pushListUndo('Edit name from details (list action)');
+      setPeople(prev => prev.map(x => x.id === personId ? ({ ...x, name: newName.trim(), lastEditISO: isoNow(), timeline: [{ ts: isoNow(), msg: `Name changed (list) to ${newName.trim()}` }, ...(x.timeline||[])] }) : x));
+    }
+
+    /******** Per-person undo/redo wrappers for UI ********/
+    function doPersonUndo(personId) { personUndo(personId); }
+    function doPersonRedo(personId) { personRedo(personId); }
+
+    /******** long-press selection utilities ********/
+    const longPressTimers = useRef({});
+    function startLongPress(id, dom) {
+      if (longPressTimers.current[id]) clearTimeout(longPressTimers.current[id]);
+      longPressTimers.current[id] = setTimeout(() => {
+        setSelectionMode(true);
+        setSelectedIds(prev => new Set(prev).add(id));
+      }, 1300);
+      if (dom) dom.classList.add('holding');
+    }
+    function cancelLongPress(id, dom) {
+      if (longPressTimers.current[id]) {
+        clearTimeout(longPressTimers.current[id]);
+        longPressTimers.current[id] = null;
+      }
+      if (dom) dom.classList.remove('holding');
+    }
+
+    /******** hover preview utilities ********/
+    function showHoverPreview(personId, evt) {
+      const el = hoverRef.current;
+      if (!el) return;
+      el._timer = setTimeout(() => {
+        const p = people.find(pp => pp.id === personId);
+        if (!p) return;
+        const rows = (p.timeline || []).slice(0,4).map(t => `<div class="mb-2"><strong>${formatLocalTime12(t.ts)}</strong><div>${escapeHtml(t.msg)}</div></div>`).join('');
+        if (!rows) { el.style.display='none'; return; }
+        el.innerHTML = rows;
+        el.style.display = 'block';
+        const x = (evt && evt.pageX) ? evt.pageX + 8 : 200;
+        const y = (evt && evt.pageY) ? evt.pageY + 8 : 120;
+        el.style.left = x + 'px';
+        el.style.top = y + 'px';
+      }, 1500);
+    }
+    function hideHoverPreview(personId) {
+      const el = hoverRef.current;
+      if (!el) return;
+      if (el._timer) { clearTimeout(el._timer); el._timer = null; }
+      el.style.display = 'none';
+    }
+
+    function escapeHtml(text='') {
+      return String(text).replace(/[&<>"'`]/g, s => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;','`':'&#96;'})[s]);
+    }
+
+    /******** keyboard shortcuts ********/
+    useEffect(() => {
+      function onKey(e) {
+        if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
+          e.preventDefault();
+          if (openPersonId) doPersonUndo(openPersonId); else listUndo();
+        }
+        if ((e.ctrlKey || e.metaKey) && (e.key.toLowerCase() === 'y' || (e.shiftKey && e.key.toLowerCase() === 'z'))) {
+          e.preventDefault();
+          if (openPersonId) doPersonRedo(openPersonId); else listRedo();
+        }
+      }
+      window.addEventListener('keydown', onKey);
+      return () => window.removeEventListener('keydown', onKey);
+    }, [openPersonId, people, listUndoStack, listRedoStack]);
+
+    /******** utility to get seq index for number generation ********/
+    function recomputeNumbers(arr) {
+      // we maintain assigned number when adding; if you need to recompute on reordering, implement here
+      // (not required now since numbers are set at creation using current length).
+      return arr;
+    }
+
+    /******** UI Render ********/
+    const sortedPeople = [...people].sort((a,b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+    const currentPerson = people.find(p => p.id === openPersonId);
+
+    return (
+      <div className="max-w-5xl mx-auto">
+        {/* Header */}
+        <header className="flex items-center justify-between py-4">
+          <h1 className="text-xl font-semibold">People List App</h1>
+          <div className="flex items-center gap-2">
+            <button
+              className="px-3 py-1 rounded border"
+              onClick={() => { if (openPersonId) doPersonUndo(openPersonId); else listUndo(); }}
+              disabled={ openPersonId ? !(people.find(p => p.id===openPersonId && p.undoStack && p.undoStack.length>0)) : listUndoStack.length===0 }
+            >↶ Undo</button>
+
+            <button
+              className="px-3 py-1 rounded border"
+              onClick={() => { if (openPersonId) doPersonRedo(openPersonId); else listRedo(); }}
+              disabled={ openPersonId ? !(people.find(p => p.id===openPersonId && p.redoStack && p.redoStack.length>0)) : listRedoStack.length===0 }
+            >↷ Redo</button>
+
+            <button className="px-3 py-1 rounded border" onClick={exportSnapshot}>Export Snapshot</button>
+          </div>
+        </header>
+
+        {/* Main */}
+        <main className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          {/* List section */}
+          <section className="md:col-span-2 bg-white p-4 rounded shadow">
+            {/* controls */}
+            <div className="flex items-center gap-2 mb-3">
+              {!selectionMode &&
+                <>
+                  <button className="px-3 py-1 rounded bg-green-500 text-white" onClick={addPerson}>+ Add Person</button>
+                  <button className="px-3 py-1 rounded border" onClick={() => {
+                    if (!confirm('Load sample data? This will replace current list in this session.')) return;
+                    pushListUndo('Load sample');
+                    const s = [
+                      makePerson('Ali','1990',1),
+                      makePerson('Shazaib','1976',2),
+                    ];
+                    setPeople(s);
+                    setOpenPersonId(null);
+                  }}>Load Sample</button>
+                </>
+              }
+              <div className="text-sm text-gray-500 ml-auto">Hold a row for 1.3s to select; click to open details</div>
+            </div>
+
+            {/* table header */}
+            <div className="grid grid-cols-3 gap-2 border-b pb-2 text-sm font-medium text-gray-600">
+              <div>Name</div>
+              <div>Assigned Number</div>
+              <div>Date Added/Edited</div>
+            </div>
+
+            {/* rows */}
+            <div className="mt-2 space-y-1">
+              {sortedPeople.map((p, idx) => {
+                const isSelected = selectedIds.has(p.id);
+                return (
+                  <div key={p.id}
+                    className={`grid grid-cols-3 gap-2 items-center p-2 rounded ${isSelected ? 'bg-red-50 border border-red-200' : 'hover:bg-slate-50'}`}
+                    onMouseDown={(e) => startLongPress(p.id, e.currentTarget)}
+                    onMouseUp={(e) => cancelLongPress(p.id, e.currentTarget)}
+                    onMouseLeave={(e) => cancelLongPress(p.id, e.currentTarget)}
+                    onTouchStart={(e) => startLongPress(p.id, e.currentTarget)}
+                    onTouchEnd={(e) => cancelLongPress(p.id, e.currentTarget)}
+                  >
+                    {/* name cell */}
+                    <div className="flex items-center gap-2" onClick={() => {
+                      if (selectionMode) {
+                        // toggle selection
+                        setSelectedIds(prev => {
+                          const copy = new Set(prev);
+                          if (copy.has(p.id)) copy.delete(p.id); else copy.add(p.id);
+                          if (copy.size === 0) setSelectionMode(false);
+                          return copy;
+                        });
+                      } else {
+                        openDetails(p.id);
+                      }
+                    }} onContextMenu={(e)=>{ e.preventDefault(); if (!selectionMode) editNameFromList(p.id); }}>
+                      <span className="font-medium">{p.name}</span>
+                    </div>
+
+                    {/* number */}
+                    <div className="text-sm text-gray-700">{p.number}</div>
+
+                    {/* date */}
+                    <div className="text-sm text-gray-500 cursor-default"
+                      onMouseEnter={(e) => showHoverPreview(p.id, e)}
+                      onMouseLeave={() => hideHoverPreview(p.id)}
+                      onClick={() => setOpenPersonId(p.id)}
+                    >
+                      {formatDateDDMMYYYY(p.lastEditISO)}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* selection delete bar */}
+            {selectionMode && (
+              <div className="fixed bottom-6 left-1/2 transform -translate-x-1/2 bg-red-600 text-white px-4 py-2 rounded shadow-lg flex items-center gap-4">
+                <div>Delete selected ({selectedIds.size})</div>
+                <button className="bg-white text-red-600 px-3 py-1 rounded" onClick={multiDeleteSelected}>Delete</button>
+                <button className="bg-white px-3 py-1 rounded" onClick={() => { setSelectionMode(false); setSelectedIds(new Set()); }}>Cancel</button>
+              </div>
+            )}
+          </section>
+
+          {/* details / timeline column */}
+          <aside className="bg-white p-4 rounded shadow">
+            {!openPersonId && (<div className="text-sm text-gray-500">Open a person to view details & timeline.</div>)}
+            {openPersonId && (() => {
+              const person = people.find(p => p.id === openPersonId);
+              if (!person) return (<div>Person not found (deleted).</div>);
+              ensurePersonStacks(person);
+              return (
+                <div>
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <button className="text-blue-600" onClick={() => setOpenPersonId(null)}>← Back</button>
+                      <div className="text-lg font-semibold mt-2">{person.name}</div>
+                      <div className="text-xs text-gray-500">{person.number}</div>
+                    </div>
+
+                    <div className="flex flex-col items-end gap-2">
+                      <div className="text-sm text-gray-500">Last: {formatDateDDMMYYYY(person.lastEditISO)}</div>
+                      <div className="flex gap-2">
+                        <button className="px-2 py-1 border rounded" onClick={() => editNameFromDetails(person.id)}>Edit Name (list)</button>
+                        <button className="px-2 py-1 border rounded" onClick={() => { pushPersonUndo(person.id); personUndo(person.id);} }>Undo (detail)</button>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="mt-4">
+                    <div className="flex items-center gap-2 mb-2">
+                      <button className="px-2 py-1 rounded border" onClick={() => addBox(person.id)}>+ Add Box</button>
+                      <button className="px-2 py-1 rounded border" onClick={() => doPersonUndo(person.id)} disabled={!(person.undoStack && person.undoStack.length>0)}>Undo</button>
+                      <button className="px-2 py-1 rounded border" onClick={() => doPersonRedo(person.id)} disabled={!(person.redoStack && person.redoStack.length>0)}>Redo</button>
+                    </div>
+
+                    <div className="space-y-2">
+                      {(person.boxes || []).map((b, bi) => (
+                        <div key={bi}
+                          className="p-2 border rounded bg-slate-50 cursor-pointer"
+                          onMouseDown={(e) => startLongPress(`${person.id}-box-${bi}`, e.currentTarget)}
+                          onMouseUp={(e) => cancelLongPress(`${person.id}-box-${bi}`, e.currentTarget)}
+                          onMouseLeave={(e) => cancelLongPress(`${person.id}-box-${bi}`, e.currentTarget)}
+                          onTouchStart={(e) => startLongPress(`${person.id}-box-${bi}`, e.currentTarget)}
+                          onTouchEnd={(e) => cancelLongPress(`${person.id}-box-${bi}`, e.currentTarget)}
+                          onClick={() => editOrDeleteBox(person.id, bi)}
+                        >
+                          <div><strong>{bi+1}. </strong>{b}</div>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* timeline preview area + full timeline button */}
+                    <div className="mt-4">
+                      <div className="font-medium mb-2">Timeline</div>
+                      <div className="max-h-56 overflow-y-auto space-y-2">
+                        {(person.timeline || []).map((t, i) => (
+                          <div key={i} className="text-sm">
+                            <div className="text-xs text-gray-500">{formatLocalTime12(t.ts)}</div>
+                            <div>{t.msg}</div>
+                          </div>
+                        ))}
+                      </div>
+                      <div className="mt-2">
+                        <button className="px-3 py-1 border rounded" onClick={() => openTimelineModal(person.id)}>Open Timeline</button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              );
+            })()}
+          </aside>
+        </main>
+
+        {/* Hover preview element */}
+        <div id="hover-preview" ref={hoverRef}></div>
+
+        {/* Timeline modal (simple full page overlay) */}
+        <TimelineModal />
+      </div>
+    );
+    /******** end return ********/
+    /******** Timeline modal component (in closure so it can access state functions) ********/
+    function TimelineModal() {
+      const [show, setShow] = useState(false);
+      const [forPersonId, setForPersonId] = useState(null);
+
+      // Expose functions to open modal by attaching to window for simplicity
+      useEffect(() => {
+        window.__openTimelineModal = (personId) => { setForPersonId(personId); setShow(true); };
+        return () => { window.__openTimelineModal = null; };
+      }, []);
+
+      if (!show || !forPersonId) return null;
+      const person = people.find(p => p.id === forPersonId);
+      if (!person) return null;
+
+      // Clicking "Undo delete person" or similar should not navigate — we just show timeline here.
+      return (
+        <div className="fixed inset-0 z-50 flex items-start justify-center p-6">
+          <div className="bg-white rounded shadow-xl w-full max-w-3xl max-h-[80vh] overflow-y-auto p-4">
+            <div className="flex items-center justify-between mb-4">
+              <div className="text-center w-full">
+                <div className="text-xl font-bold">{person.name}</div>
+                <div className="font-semibold mt-1">{person.number}</div>
+              </div>
+              <div className="ml-4">
+                <button className="px-3 py-1 border rounded" onClick={() => setShow(false)}>Close</button>
+              </div>
+            </div>
+            <div className="space-y-3">
+              {(person.timeline || []).map((t, i) => (
+                <div key={i} className="p-2 border rounded">
+                  <div className="text-xs text-gray-500">{formatLocalTime12(t.ts)}</div>
+                  <div>{t.msg}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      );
+    } // end TimelineModal
+
+    // helper to open timeline via closure-accessible function
+    function openTimelineModal(personId) {
+      if (window.__openTimelineModal) window.__openTimelineModal(personId);
+    }
+
+  } // end App
+
+  // Render
+  ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
+
+  </script>
+</body>
+</html>
